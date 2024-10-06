@@ -1,0 +1,22 @@
+
+{
+  "name": "bondhive",
+  "version": "1.0.0",
+  "description": "BondHive Smart Contracts",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "BondHive Team",
+  "license": "MIT",
+  "devDependencies": {
+    "@nomiclabs/hardhat-etherscan": "^3.1.8",
+    "hardhat": "^2.22.1"
+  },
+  "dependencies": {
+    "@nomiclabs/hardhat-ethers": "^2.2.3",
+    "@openzeppelin/contracts": "4.9.0",
+    "@uniswap/v2-core": "^1.0.1",
+    "dotenv": "^16.4.5"
+  }
+}
