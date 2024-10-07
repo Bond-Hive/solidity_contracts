@@ -11,7 +11,7 @@ import "./BondFactory.sol"; // Import the BondFactory
  * @dev A vault contract for managing multiple bonds/products.
  */
 contract Vault is ReentrancyGuard, Ownable {
-    /// @notice Decimals value
+    /// @notice Decimals value (for shares and quotes)
     uint public constant DECIMALS = 18;
     /// @notice Number of strategies
     uint public productsCounter;
@@ -69,6 +69,12 @@ contract Vault is ReentrancyGuard, Ownable {
         uint productId = productsCounter;
         require(!products[productId].initialized, "Product already initialized");
 
+        // Fetch the token's decimals
+        uint8 tokenDecimals = IERC20Metadata(params.token).decimals();
+
+        // Ensure token decimals do not exceed 18
+        require(tokenDecimals <= DECIMALS, "Token decimals cannot exceed 18");
+
         // Deploy the ShareToken (bond) using BondFactory
         address bondAddress = bondFactory.createBond(params.bondName, params.bondSymbol, address(this));
 
@@ -87,8 +93,9 @@ contract Vault is ReentrancyGuard, Ownable {
             treasury: params.treasury,
             minDeposit: params.minDeposit,
             initialized: true,
-            stopped: false
-        });    
+            stopped: false,
+            tokenDecimals: tokenDecimals
+        });
 
         productsCounter++;
         emit ProductInitialized(productId, bondAddress, params.startTime, params.endTime);
@@ -154,7 +161,11 @@ contract Vault is ReentrancyGuard, Ownable {
         require(product.currentQuote == expectedQuote, "Quote changed");
         require(block.timestamp <= product.quoteExpiration, "Quote expired");
 
-        uint quantity = (amount * product.currentQuote) / (10 ** DECIMALS);
+        // Adjust amount to 18 decimals (shares have 18 decimals)
+        uint adjustedAmount = amount * (10 ** (DECIMALS - product.tokenDecimals));
+
+        // Now calculate the shares to mint based on the adjusted amount
+        uint quantity = (adjustedAmount * product.currentQuote) / (10 ** DECIMALS);
 
         // Transfer tokens from sender to treasury
         IERC20(product.token).transferFrom(msg.sender, product.treasury, amount);
