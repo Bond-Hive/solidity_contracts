@@ -5,6 +5,7 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol"; // For reentrancy pr
 import "@openzeppelin/contracts/access/Ownable.sol"; // For admin control
 import "@openzeppelin/contracts/token/ERC20/extensions/ERC4626.sol"; // Import ERC4626
 import "@openzeppelin/contracts/utils/math/Math.sol"; // Import Math
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol"; // Import SafeERC20 for safe token transfers
 import "./interfaces/IVault.sol"; // Interfaces and structs
 
 /**
@@ -13,6 +14,7 @@ import "./interfaces/IVault.sol"; // Interfaces and structs
  */
 contract Vault is ERC4626, ReentrancyGuard, Ownable {
     using Math for uint256;
+
     /// @notice Decimals value (for shares and quotes)
     uint8 public constant DECIMALS = 18;
     /// @notice Invest token decimals
@@ -27,11 +29,11 @@ contract Vault is ERC4626, ReentrancyGuard, Ownable {
     /// @notice Oracle address
     address public oracle;
 
-    /// @notice Total deposits received
+    // Total deposits received (internal use)
     uint private _totalDeposits;
-    /// @notice Total amount available for redemption
+    // Total amount available for redemption (internal use)
     uint private _availableRedemption;
-    /// @notice Current quote price
+    // Current quote price (internal use)
     uint private _currentQuote;
 
     /// @notice Start time for deposits
@@ -52,42 +54,65 @@ contract Vault is ERC4626, ReentrancyGuard, Ownable {
     /// @notice Indicates if available redemption amount is set
     bool public availableRedemptionSet;
 
-    /// @notice Event emitted when the product is initialized.
+    /**
+     * @notice Emitted when the product is initialized.
+     * @param startTime The start time for deposits.
+     * @param endTime The end time (maturity).
+     */
     event ProductInitialized(
         uint startTime,
         uint endTime
     );
-    /// @notice Event emitted when the quote is set.
+
+    /**
+     * @notice Emitted when the quote is set.
+     * @param amount The new quote amount.
+     */
     event QuoteSet(uint amount);
-    /// @notice Event emitted when the available redemption amount is set.
+
+    /**
+     * @notice Emitted when the available redemption amount is set.
+     * @param amount The total amount of available redemption.
+     */
     event AvailableRedemptionSet(uint amount);
-    /// @notice Event emitted when the custodian is set.
+
+    /**
+     * @notice Emitted when the custodian address is updated.
+     * @param newCustodian The new custodian address.
+     */
     event CustodianSet(address indexed newCustodian);
-    /// @notice Event emitted when the contract is stopped.
+
+    /**
+     * @notice Emitted when the contract's stopped state is updated.
+     * @param stopped The new stopped state.
+     */
     event ContractStopped(bool stopped);
 
     ////////// MODIFIERS ////////
 
+    /**
+     * @dev Modifier to ensure the contract is not stopped.
+     */
     modifier whenNotStopped() {
         require(!stopped, "Contract is stopped");
         _;
     }
 
+    /**
+     * @dev Modifier to restrict function access to the designated oracle.
+     */
     modifier onlyOracle() {
         require(msg.sender == oracle, "Caller is not the oracle");
         _;
     }
 
-    ////////// INITIALIZATION FUNCTIONS ////////
+    ////////// CONSTRUCTOR ////////
 
     /**
-     * @dev Initializes the Vault contract with the specified asset, name, and symbol.
-     * 
-     * This constructor sets up the Vault contract by linking it to the specified asset, assigning a name and symbol to the Vault's ERC20 token, and ensuring that the asset's decimals do not exceed the maximum allowed (18).
-     * 
+     * @notice Constructor to initialize the Vault contract.
      * @param asset_ The address of the ERC20 asset that this Vault will manage.
-     * @param name_ The name of the ERC20 token that represents shares in this Vault.
-     * @param symbol_ The symbol of the ERC20 token that represents shares in this Vault.
+     * @param name_ The name of the ERC20 token representing shares.
+     * @param symbol_ The symbol of the ERC20 token representing shares.
      */
     constructor(
         IERC20 asset_,
@@ -101,8 +126,11 @@ contract Vault is ERC4626, ReentrancyGuard, Ownable {
         require(tokenDecimals <= DECIMALS, "Token decimals cannot exceed 18");
     }
 
+    ////////// INITIALIZATION FUNCTION ////////
+
     /**
-     * @dev Initialize the product.
+     * @notice Initializes the product.
+     * @dev Can only be called by the owner and only once.
      * @param params Struct containing initialization parameters.
      */
     function initializeProduct(ProductParams memory params) external onlyOwner {
@@ -123,7 +151,7 @@ contract Vault is ERC4626, ReentrancyGuard, Ownable {
     ////////// READ FUNCTIONS ////////
 
     /**
-     * @dev Returns the total amount of assets deposited.
+     * @notice Returns the total amount of assets deposited.
      * @return Total deposited assets.
      */
     function totalAssets() public view override returns (uint) {
@@ -131,8 +159,8 @@ contract Vault is ERC4626, ReentrancyGuard, Ownable {
     }
 
     /**
-     * @dev Returns the available redemption amount if set.
-     * @return Available redemption amount if set.
+     * @notice Returns the available redemption amount if set.
+     * @return Available redemption amount.
      */
     function availableRedemption() external view returns (uint) {
         require(availableRedemptionSet, "Available redemption not set");
@@ -140,7 +168,7 @@ contract Vault is ERC4626, ReentrancyGuard, Ownable {
     }
 
     /**
-     * @dev Returns the maturity timestamp.
+     * @notice Returns the maturity timestamp.
      * @return Maturity timestamp.
      */
     function maturity() external view returns (uint) {
@@ -148,7 +176,7 @@ contract Vault is ERC4626, ReentrancyGuard, Ownable {
     }
 
     /**
-     * @dev Returns the custodian address.
+     * @notice Returns the custodian address.
      * @return Custodian address.
      */
     function custodianAccount() external view returns (address) {
@@ -158,13 +186,9 @@ contract Vault is ERC4626, ReentrancyGuard, Ownable {
     ////////// QUOTE FUNCTIONS ////////
 
     /**
-     * @dev Retrieves the current quote value. If the quote has expired, it returns zero.
-     * 
-     * This function checks the current block timestamp against the quote expiration timestamp. If the current timestamp is
-     * less than or equal to the expiration timestamp, it returns the current quote value. Otherwise, it returns zero,
-     * indicating that the quote has expired.
-     * 
-     * @return The current quote value if it is still valid, otherwise zero.
+     * @notice Retrieves the current quote value.
+     * @dev Returns the current quote if still valid; otherwise, returns zero.
+     * @return The current quote value if valid, or zero if expired.
      */
     function quote() public view returns (uint) {
         if (block.timestamp <= quoteExpiration) {
@@ -175,12 +199,8 @@ contract Vault is ERC4626, ReentrancyGuard, Ownable {
     }
 
     /**
-     * @dev Updates the current quote with a new value. This function can only be called by the oracle and when the contract is not stopped.
-     * 
-     * It first checks if the new quote amount is valid (greater than zero) and if the contract has not yet reached its maturity date.
-     * Then, it verifies if there is a current quote that has not yet expired. If all conditions are met, it updates the current quote
-     * with the new amount and sets a new expiration timestamp based on the current block timestamp and the quote period.
-     * 
+     * @notice Updates the current quote with a new value.
+     * @dev Can only be called by the oracle when the contract is not stopped and before maturity.
      * @param amount The new quote amount to be set.
      */
     function setQuote(uint amount) external onlyOracle whenNotStopped {
@@ -198,10 +218,8 @@ contract Vault is ERC4626, ReentrancyGuard, Ownable {
     ////////// DEPOSIT FUNCTIONS ////////
 
     /**
-     * @dev Deposits assets into the vault in exchange for shares.
-     * 
-     * This function checks the deposit timing, amount, and quote validity before executing the deposit.
-     * 
+     * @notice Deposits assets into the vault in exchange for shares.
+     * @dev Validates deposit timing, minimum amount, and quote validity before execution.
      * @param assets The amount of assets to deposit.
      * @param receiver The address to receive the minted shares.
      * @return The amount of shares minted.
@@ -210,6 +228,7 @@ contract Vault is ERC4626, ReentrancyGuard, Ownable {
         require(block.timestamp >= startTime && block.timestamp <= endTime, "Invalid deposit timing");
         require(assets >= minDeposit, "Amount less than min deposit");
         require(block.timestamp <= quoteExpiration, "Quote expired");
+        require(quote() > 0, "Quote not defined");
 
         uint maxAssets = maxDeposit(receiver);
         if (assets > maxAssets) {
@@ -222,32 +241,29 @@ contract Vault is ERC4626, ReentrancyGuard, Ownable {
         return shares;
     }
 
-     /**
-     * @dev Enhanced deposit function with quote validation.
-     * 
-     * This function allows users to specify the expected quote to ensure it matches the current quote before proceeding with the deposit.
-     * 
+    /**
+     * @notice Deposits assets into the vault with quote validation.
+     * @dev Allows users to specify an expected quote to ensure it matches the current quote before depositing.
      * @param assets Amount of tokens to deposit.
-     * @param expectedQuote The expected current quote, used for validation.
+     * @param expectedQuote The expected current quote for validation.
      * @param receiver The address to receive the minted shares.
      * @return The amount of shares minted.
      */
     function deposit(uint assets, uint expectedQuote, address receiver) public virtual nonReentrant whenNotStopped returns (uint) {
-        // Validate deposit timing and amount
         require(block.timestamp >= startTime, "Not open yet");
         require(block.timestamp <= endTime, "Maturity reached");
         require(assets >= minDeposit, "Amount less than min deposit");
-        // Validate quote
-        require(_currentQuote == expectedQuote, "Quote changed");
+
+        uint quoteValue = quote();
+        require(quoteValue > 0, "Quote not defined");
+        require(quoteValue == expectedQuote, "Quote changed");
         require(block.timestamp <= quoteExpiration, "Quote expired");
 
-        // Check max deposit limit
         uint maxAssets = maxDeposit(receiver);
         if (assets > maxAssets) {
             revert ERC4626ExceededMaxDeposit(receiver, assets, maxAssets);
         }
 
-        // Calculate and mint shares
         uint shares = previewDeposit(assets);
         _deposit(_msgSender(), receiver, assets, shares);
 
@@ -257,18 +273,17 @@ contract Vault is ERC4626, ReentrancyGuard, Ownable {
     ////////// MINT FUNCTIONS ////////
 
     /**
-     * @dev Mint function with basic validation.
-     * 
-     * This function allows users to mint shares with basic validation of timing and amount.
-     * 
+     * @notice Mints shares by depositing the corresponding amount of assets.
+     * @dev Validates timing, quote, and deposit minimum before minting.
      * @param shares The amount of shares to mint.
      * @param receiver The address to receive the minted shares.
-     * @return The amount of assets minted.
+     * @return The amount of assets deposited to mint the shares.
      */
     function mint(uint256 shares, address receiver) public virtual nonReentrant whenNotStopped override returns (uint) {
         require(block.timestamp >= startTime, "Not open yet");
         require(block.timestamp <= endTime, "Maturity reached");
         require(block.timestamp <= quoteExpiration, "Quote expired");
+        require(quote() > 0, "Quote not defined");
 
         uint256 maxShares = maxMint(receiver);
         if (shares > maxShares) {
@@ -283,19 +298,20 @@ contract Vault is ERC4626, ReentrancyGuard, Ownable {
     }
 
     /**
-     * @dev Mint function with quote validation.
-     * 
-     * This function allows users to specify the expected quote to ensure it matches the current quote before proceeding with the mint.
-     * 
+     * @notice Mints shares with quote validation.
+     * @dev Allows users to specify an expected quote to ensure it matches the current quote before minting.
      * @param shares The amount of shares to mint.
-     * @param expectedQuote The expected current quote, used for validation.
+     * @param expectedQuote The expected current quote for validation.
      * @param receiver The address to receive the minted shares.
-     * @return The amount of assets minted.
+     * @return The amount of assets deposited to mint the shares.
      */
     function mint(uint256 shares, uint expectedQuote, address receiver) public virtual nonReentrant whenNotStopped returns (uint) {
         require(block.timestamp >= startTime, "Not open yet");
         require(block.timestamp <= endTime, "Maturity reached");
-        require(_currentQuote == expectedQuote, "Quote changed");
+
+        uint quoteValue = quote();
+        require(quoteValue > 0, "Quote not defined");
+        require(quoteValue == expectedQuote, "Quote changed");
         require(block.timestamp <= quoteExpiration, "Quote expired");
 
         uint256 maxShares = maxMint(receiver);
@@ -313,13 +329,11 @@ contract Vault is ERC4626, ReentrancyGuard, Ownable {
     ////////// WITHDRAW FUNCTIONS ////////
 
     /**
-     * @dev Withdraws assets from the vault by burning shares.
-     * 
-     * This function allows users to withdraw assets from the vault by burning their shares. It checks for maturity, available redemption, and total supply before proceeding.
-     * 
+     * @notice Withdraws assets from the vault by burning shares.
+     * @dev Can only be executed after maturity. Checks available redemption and share supply.
      * @param assets The amount of assets to withdraw.
      * @param receiver The address to receive the withdrawn assets.
-     * @param owner The address of the owner of the shares to be burned.
+     * @param owner The owner of the shares to be burned.
      * @return The amount of shares burned.
      */
     function withdraw(uint256 assets, address receiver, address owner) public virtual nonReentrant override returns (uint) {
@@ -339,13 +353,11 @@ contract Vault is ERC4626, ReentrancyGuard, Ownable {
     }
 
     /**
-     * @dev Redeems shares for assets.
-     * 
-     * This function allows users to redeem their shares for assets. It checks for maturity, available redemption, and total supply before proceeding.
-     * 
+     * @notice Redeems shares for assets.
+     * @dev Can only be executed after maturity. Checks available redemption and share supply.
      * @param shares The amount of shares to redeem.
      * @param receiver The address to receive the redeemed assets.
-     * @param owner The address of the owner of the shares to be redeemed.
+     * @param owner The owner of the shares to be redeemed.
      * @return The amount of assets redeemed.
      */
     function redeem(uint256 shares, address receiver, address owner) public virtual nonReentrant override returns (uint256) {
@@ -367,9 +379,9 @@ contract Vault is ERC4626, ReentrancyGuard, Ownable {
     ////////// ADMIN FUNCTIONS ////////
 
     /**
-     * @dev This function sets the stopped state of the contract. It can only be called by the owner of the contract.
-     * 
-     * @param _stopped A boolean value indicating the new stopped state of the contract. If true, the contract is stopped; otherwise, it is not stopped.
+     * @notice Sets the stopped state of the contract.
+     * @dev Can only be called by the owner.
+     * @param _stopped Boolean indicating the new stopped state.
      */
     function setContractStopped(bool _stopped) external onlyOwner {
         stopped = _stopped;
@@ -377,12 +389,8 @@ contract Vault is ERC4626, ReentrancyGuard, Ownable {
     }
 
     /**
-     * @dev Sets the total amount of assets available for redemption by users. This function can only be called by the owner of the contract.
-     * 
-     * This function updates the total amount of assets available for redemption by users. It first checks if the maturity time has been reached and if the available redemption amount has not been set before. 
-     * Then, it transfers the specified amount of assets from the owner's address to the contract's address, effectively setting the available redemption amount. 
-     * Finally, it emits an event to notify of the change.
-     * 
+     * @notice Sets the total amount of assets available for redemption.
+     * @dev Can only be called by the owner after maturity and if not already set. Transfers assets from the owner to the contract.
      * @param amount The total amount of assets to be made available for redemption.
      */
     function setTotalRedemption(uint amount) external onlyOwner {
@@ -398,8 +406,8 @@ contract Vault is ERC4626, ReentrancyGuard, Ownable {
     }
 
     /**
-     * @dev Updates the address of the custodian responsible for managing the vault's assets. This function can only be called by the owner of the contract.
-     * 
+     * @notice Updates the custodian address.
+     * @dev Can only be called by the owner.
      * @param newCustodian The address of the new custodian.
      */
     function setCustodian(address newCustodian) external onlyOwner {
@@ -408,8 +416,8 @@ contract Vault is ERC4626, ReentrancyGuard, Ownable {
     }
 
     /**
-     * @dev Updates the address of the oracle responsible for setting the quote. This function can only be called by the owner of the contract.
-     * 
+     * @notice Updates the oracle address.
+     * @dev Can only be called by the owner.
      * @param newOracle The address of the new oracle.
      */
     function setOracle(address newOracle) external onlyOwner {
@@ -419,10 +427,8 @@ contract Vault is ERC4626, ReentrancyGuard, Ownable {
     ////////// INTERNAL FUNCTIONS ////////
 
     /**
-     * @dev Executes the common deposit/mint workflow.
-     * 
-     * This function verifies the allowance, transfers assets to the custodian, mints shares, updates total deposits, and emits a Deposit event.
-     * 
+     * @notice Executes the common deposit/mint workflow.
+     * @dev Verifies allowance, transfers assets to the custodian, mints shares, updates total deposits, and emits a Deposit event.
      * @param caller The address initiating the deposit.
      * @param receiver The address to receive the minted shares.
      * @param assets The amount of assets to deposit.
@@ -434,7 +440,7 @@ contract Vault is ERC4626, ReentrancyGuard, Ownable {
         // Transfer tokens from sender to custodian
         SafeERC20.safeTransferFrom(IERC20(asset()), caller, _custodian, assets);
 
-        // Mint share tokens to sender
+        // Mint share tokens to receiver
         _mint(receiver, shares);
 
         _totalDeposits += assets;
@@ -442,15 +448,13 @@ contract Vault is ERC4626, ReentrancyGuard, Ownable {
     }
 
     /**
-     * @dev Executes the common workflow for withdrawing/redeeming shares.
-     * 
-     * This function handles the logic for withdrawing assets from the vault by burning shares. It checks for allowance, burns shares, updates available redemption, transfers assets, and emits a Withdraw event.
-     * 
+     * @notice Executes the common workflow for withdrawing/redeeming shares.
+     * @dev Handles allowance checking, burning shares, updating available redemption, transferring assets, and emitting a Withdraw event.
      * @param caller The address initiating the withdrawal.
      * @param receiver The address to receive the withdrawn assets.
-     * @param owner The address of the owner of the shares to be burned.
-     * @param assets The amount of assets to be withdrawn.
-     * @param shares The amount of shares to be burned.
+     * @param owner The owner of the shares to be burned.
+     * @param assets The amount of assets to withdraw.
+     * @param shares The amount of shares to burn.
      */
     function _withdraw(
         address caller,
@@ -472,19 +476,17 @@ contract Vault is ERC4626, ReentrancyGuard, Ownable {
     }
 
     /**
-     * @dev Override the _decimalsOffset function to return the correct offset.
-     * 
-     * This function calculates the offset in the decimal representation between the underlying asset's decimals
-     * and the vault decimals.
-     * 
-     * @return The calculated offset.
+     * @notice Calculates the decimal offset between the underlying asset and the vault.
+     * @dev Returns the difference between the constant DECIMALS and the token's decimals.
+     * @return The calculated decimal offset.
      */
     function _decimalsOffset() internal view virtual override returns (uint8) {
         return DECIMALS - tokenDecimals;
     }
 
     /**
-     * @dev Internal conversion function (from assets to shares) with support for rounding direction.
+     * @notice Converts a given amount of assets to shares.
+     * @dev Adjusts for decimal differences and uses the current quote for conversion.
      * @param assets The amount of assets to convert.
      * @param rounding The rounding direction to use.
      * @return The calculated amount of shares.
@@ -493,20 +495,19 @@ contract Vault is ERC4626, ReentrancyGuard, Ownable {
         // Adjust amount to 18 decimals (shares have 18 decimals)
         uint adjustedAmount = assets * (10 ** (_decimalsOffset()));
 
-        // Now calculate the shares to mint based on the adjusted amount
+        // Check if the quote is defined
+        require(quote() > 0, "Quote not defined");
+
+        // Calculate the shares to mint based on the adjusted amount
         return adjustedAmount.mulDiv(quote(), 10 ** DECIMALS, rounding);
     }
 
     /**
-     * @dev This function converts a given amount of shares to assets, taking into account the rounding direction specified.
-     * 
-     * It first checks if the available redemption amount is greater than zero, ensuring that there are assets available for redemption.
-     * Then, it calculates the equivalent asset amount for the given shares by dividing the available redemption amount by the total supply of shares,
-     * applying the specified rounding direction to the result.
-     * 
-     * @param shares The amount of shares to convert to assets.
-     * @param rounding The rounding direction to use for the conversion.
-     * @return The calculated amount of assets equivalent to the given shares.
+     * @notice Converts a given amount of shares to assets.
+     * @dev Uses the available redemption and total supply to determine the asset amount.
+     * @param shares The amount of shares to convert.
+     * @param rounding The rounding direction to use.
+     * @return The calculated asset amount.
      */
     function _convertToAssets(uint shares, Math.Rounding rounding) internal view virtual override returns (uint) {
         require(_availableRedemption > 0, "AvailableRedemption must be greater than 0");
@@ -516,18 +517,21 @@ contract Vault is ERC4626, ReentrancyGuard, Ownable {
     ////////// HELPER FUNCTIONS ////////
 
     /**
-     * @dev Preview mint amount based on shares.
-     * @param shares Shares to mint.
-     * @return Assets required for minting.
+     * @notice Previews the amount of assets required to mint a given number of shares.
+     * @param shares The number of shares to mint.
+     * @return The amount of assets required.
      */
     function previewMint(uint256 shares) public view virtual override returns (uint) {
-        return shares.mulDiv(10 ** DECIMALS, quote(), Math.Rounding.Ceil) / 10 ** (_decimalsOffset());
+        uint quoteValue = quote();
+        require(quoteValue > 0, "Quote not defined");
+        
+        return shares.mulDiv(10 ** DECIMALS, quoteValue, Math.Rounding.Ceil) / 10 ** (_decimalsOffset());
     }
 
     /**
-     * @dev Preview withdraw amount based on assets.
-     * @param assets Assets to withdraw.
-     * @return Shares to be withdrawn.
+     * @notice Previews the number of shares that will be withdrawn for a given asset amount.
+     * @param assets The amount of assets to withdraw.
+     * @return The number of shares to be burned.
      */
     function previewWithdraw(uint256 assets) public view virtual override returns (uint) {
         require(_availableRedemption > 0, "AvailableRedemption must be greater than 0");
