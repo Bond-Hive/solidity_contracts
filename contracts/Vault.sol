@@ -1,320 +1,536 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.19;
+pragma solidity 0.8.28;
 
-import "./dependencies/ReentrancyGuard.sol"; // For reentrancy protection
-import "./dependencies/Ownable.sol"; // For admin control
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol"; // For reentrancy protection
+import "@openzeppelin/contracts/access/Ownable.sol"; // For admin control
+import "@openzeppelin/contracts/token/ERC20/extensions/ERC4626.sol"; // Import ERC4626
+import "@openzeppelin/contracts/utils/math/Math.sol"; // Import Math
 import "./interfaces/IVault.sol"; // Interfaces and structs
-import "./BondFactory.sol"; // Import the BondFactory
 
 /**
  * @title Vault
- * @dev A vault contract for managing multiple bonds/products.
+ * @dev A vault contract for managing a bond product.
  */
-contract Vault is ReentrancyGuard, Ownable {
+contract Vault is ERC4626, ReentrancyGuard, Ownable {
+    using Math for uint256;
     /// @notice Decimals value (for shares and quotes)
-    uint public constant DECIMALS = 18;
-    /// @notice Number of strategies
-    uint public productsCounter;
+    uint8 public constant DECIMALS = 18;
+    /// @notice Invest token decimals
+    uint8 public tokenDecimals;
+
     /// @notice Contract dev
     string public dev = "t.me/frankfourier";
 
-    // Mapping from productId to Product
-    mapping(uint => Product) public products;
+    // Product properties
+    /// @notice Custodian address
+    address public _custodian;
+    /// @notice Oracle address
+    address public oracle;
 
-    // Reference to the BondFactory
-    BondFactory public bondFactory;
+    /// @notice Total deposits received
+    uint private _totalDeposits;
+    /// @notice Total amount available for redemption
+    uint private _availableRedemption;
+    /// @notice Current quote price
+    uint private _currentQuote;
 
-    // Events
-    event ProductInitialized(uint indexed productId, address indexed bondAddress, uint startTime, uint endTime);
-    event SharesMinted(uint indexed productId, address indexed to, uint amount);
-    event SharesBurned(uint indexed productId, uint amount);
-    event Deposit(uint indexed productId, address indexed from, uint amount, uint shares);
-    event Withdraw(uint indexed productId, address indexed to, uint shares, uint amount);
-    event QuoteSet(uint indexed productId, uint amount);
-    event AvailableRedemptionSet(uint indexed productId, uint amount);
-    event AdminChanged(uint indexed productId, address indexed newAdmin);
-    event TreasurySet(uint indexed productId, address indexed newTreasury);
-    event ContractStopped(uint indexed productId, bool stopped);
+    /// @notice Start time for deposits
+    uint public startTime;
+    /// @notice End time (maturity)
+    uint public endTime;
+    /// @notice Quote expiration timestamp
+    uint public quoteExpiration;
+    /// @notice Duration for which the quote is valid
+    uint public quotePeriod;
+    /// @notice Minimum deposit amount
+    uint public minDeposit;
 
-    // Modifiers
-    modifier onlyProductAdmin(uint productId) {
-        require(msg.sender == products[productId].admin, "Not product admin");
+    /// @notice Whether the product is initialized
+    bool public initialized;
+    /// @notice Whether the product is stopped
+    bool public stopped;
+    /// @notice Indicates if available redemption amount is set
+    bool public availableRedemptionSet;
+
+    /// @notice Event emitted when the product is initialized.
+    event ProductInitialized(
+        uint startTime,
+        uint endTime
+    );
+    /// @notice Event emitted when the quote is set.
+    event QuoteSet(uint amount);
+    /// @notice Event emitted when the available redemption amount is set.
+    event AvailableRedemptionSet(uint amount);
+    /// @notice Event emitted when the custodian is set.
+    event CustodianSet(address indexed newCustodian);
+    /// @notice Event emitted when the contract is stopped.
+    event ContractStopped(bool stopped);
+
+    ////////// MODIFIERS ////////
+
+    modifier whenNotStopped() {
+        require(!stopped, "Contract is stopped");
         _;
     }
 
-    modifier whenNotStopped(uint productId) {
-        require(!products[productId].stopped, "Contract is stopped");
+    modifier onlyOracle() {
+        require(msg.sender == oracle, "Caller is not the oracle");
         _;
     }
 
-    modifier checkProductExistence(uint productId) {
-        require(productsCounter > productId, "Product doesn't exist");
-        _;
-    }
+    ////////// INITIALIZATION FUNCTIONS ////////
 
     /**
-     * @dev Constructor to set the BondFactory address.
+     * @dev Initializes the Vault contract with the specified asset, name, and symbol.
+     * 
+     * This constructor sets up the Vault contract by linking it to the specified asset, assigning a name and symbol to the Vault's ERC20 token, and ensuring that the asset's decimals do not exceed the maximum allowed (18).
+     * 
+     * @param asset_ The address of the ERC20 asset that this Vault will manage.
+     * @param name_ The name of the ERC20 token that represents shares in this Vault.
+     * @param symbol_ The symbol of the ERC20 token that represents shares in this Vault.
      */
-    constructor() {
-        bondFactory = new BondFactory();
-    }
-
-    /**
-     * @dev Initialize a new product.
-     * @param params Struct containing initialization parameters.
-     */
-    function initializeProduct(
-        ProductParams memory params
-    ) external onlyOwner {
-        uint productId = productsCounter;
-        require(!products[productId].initialized, "Product already initialized");
-
+    constructor(
+        IERC20 asset_,
+        string memory name_,
+        string memory symbol_
+    ) ERC4626(asset_) ERC20(name_, symbol_) Ownable(msg.sender) {
         // Fetch the token's decimals
-        uint8 tokenDecimals = IERC20Metadata(params.token).decimals();
+        tokenDecimals = IERC20Metadata(asset()).decimals();
 
         // Ensure token decimals do not exceed 18
         require(tokenDecimals <= DECIMALS, "Token decimals cannot exceed 18");
-
-        // Deploy the ShareToken (bond) using BondFactory
-        address bondAddress = bondFactory.createBond(params.bondName, params.bondSymbol, address(this));
-
-        products[productId] = Product({
-            token: params.token,
-            tokenShare: bondAddress,
-            admin: params.admin,
-            startTime: params.startTime,
-            endTime: params.endTime,
-            totalShares: 0,
-            totalDeposits: 0,
-            availableRedemption: 0,
-            currentQuote: 0,
-            quoteExpiration: 0,
-            quotePeriod: params.quotePeriod,
-            treasury: params.treasury,
-            minDeposit: params.minDeposit,
-            initialized: true,
-            stopped: false,
-            tokenDecimals: tokenDecimals
-        });
-
-        productsCounter++;
-        emit ProductInitialized(productId, bondAddress, params.startTime, params.endTime);
     }
 
     /**
-     * @dev Set the contract's stopped state for a product.
-     * @param productId Unique ID for the product.
-     * @param _stopped Boolean indicating the new stopped state.
+     * @dev Initialize the product.
+     * @param params Struct containing initialization parameters.
      */
-    function setContractStopped(uint productId, bool _stopped) external onlyProductAdmin(productId) checkProductExistence(productId) {
-        products[productId].stopped = _stopped;
-        emit ContractStopped(productId, _stopped);
+    function initializeProduct(ProductParams memory params) external onlyOwner {
+        require(!initialized, "Product already initialized");
+
+        oracle = params.oracle;
+        startTime = params.startTime;
+        endTime = params.endTime;
+        minDeposit = params.minDeposit;
+        quotePeriod = params.quotePeriod;
+        _custodian = params.custodian;
+        initialized = true;
+        stopped = false;
+
+        emit ProductInitialized(startTime, endTime);
+    }
+
+    ////////// READ FUNCTIONS ////////
+
+    /**
+     * @dev Returns the total amount of assets deposited.
+     * @return Total deposited assets.
+     */
+    function totalAssets() public view override returns (uint) {
+        return _totalDeposits;
     }
 
     /**
-     * @dev Get the current quote for a product.
-     * @param productId Unique ID for the product.
-     * @return The current quote if valid, otherwise zero.
+     * @dev Returns the available redemption amount if set.
+     * @return Available redemption amount if set.
      */
-    function quote(uint productId) external view checkProductExistence(productId) returns (uint) {
-        Product storage product = products[productId];
-        if (block.timestamp <= product.quoteExpiration) {
-            return product.currentQuote;
+    function availableRedemption() external view returns (uint) {
+        require(availableRedemptionSet, "Available redemption not set");
+        return _availableRedemption;
+    }
+
+    /**
+     * @dev Returns the maturity timestamp.
+     * @return Maturity timestamp.
+     */
+    function maturity() external view returns (uint) {
+        return endTime;
+    }
+
+    /**
+     * @dev Returns the custodian address.
+     * @return Custodian address.
+     */
+    function custodianAccount() external view returns (address) {
+        return _custodian;
+    }
+
+    ////////// QUOTE FUNCTIONS ////////
+
+    /**
+     * @dev Retrieves the current quote value. If the quote has expired, it returns zero.
+     * 
+     * This function checks the current block timestamp against the quote expiration timestamp. If the current timestamp is
+     * less than or equal to the expiration timestamp, it returns the current quote value. Otherwise, it returns zero,
+     * indicating that the quote has expired.
+     * 
+     * @return The current quote value if it is still valid, otherwise zero.
+     */
+    function quote() public view returns (uint) {
+        if (block.timestamp <= quoteExpiration) {
+            return _currentQuote;
         } else {
             return 0;
         }
     }
 
     /**
-     * @dev Set a new quote for a product.
-     * @param productId Unique ID for the product.
-     * @param amount The new quote amount.
+     * @dev Updates the current quote with a new value. This function can only be called by the oracle and when the contract is not stopped.
+     * 
+     * It first checks if the new quote amount is valid (greater than zero) and if the contract has not yet reached its maturity date.
+     * Then, it verifies if there is a current quote that has not yet expired. If all conditions are met, it updates the current quote
+     * with the new amount and sets a new expiration timestamp based on the current block timestamp and the quote period.
+     * 
+     * @param amount The new quote amount to be set.
      */
-    function setQuote(uint productId, uint amount) external onlyProductAdmin(productId) checkProductExistence(productId) {
+    function setQuote(uint amount) external onlyOracle whenNotStopped {
         require(amount > 0, "Invalid amount");
-        Product storage product = products[productId];
+        require(block.timestamp < endTime, "Maturity reached, quote cannot be set anymore");
 
-        if (product.currentQuote != 0 && block.timestamp <= product.quoteExpiration) {
+        if (_currentQuote != 0 && block.timestamp <= quoteExpiration) {
             revert("Quote still valid");
         }
-        product.currentQuote = amount;
-        product.quoteExpiration = block.timestamp + product.quotePeriod;
-        emit QuoteSet(productId, amount);
+        _currentQuote = amount;
+        quoteExpiration = block.timestamp + quotePeriod;
+        emit QuoteSet(amount);
     }
 
+    ////////// DEPOSIT FUNCTIONS ////////
+
     /**
-     * @dev Deposit tokens into the vault for a product in exchange for shares.
-     * @param productId Unique ID for the product.
-     * @param amount Amount of tokens to deposit.
-     * @param expectedQuote The expected current quote.
+     * @dev Deposits assets into the vault in exchange for shares.
+     * 
+     * This function checks the deposit timing, amount, and quote validity before executing the deposit.
+     * 
+     * @param assets The amount of assets to deposit.
+     * @param receiver The address to receive the minted shares.
      * @return The amount of shares minted.
      */
-    function deposit(
-        uint productId,
-        uint amount,
-        uint expectedQuote
-    ) external nonReentrant whenNotStopped(productId) checkProductExistence(productId) returns (uint) {
-        Product storage product = products[productId];
-        require(block.timestamp >= product.startTime, "Not open yet");
-        require(block.timestamp <= product.endTime, "Maturity reached");
-        require(amount >= product.minDeposit, "Amount less than min deposit");
-        require(product.currentQuote == expectedQuote, "Quote changed");
-        require(block.timestamp <= product.quoteExpiration, "Quote expired");
+    function deposit(uint assets, address receiver) public virtual nonReentrant whenNotStopped override returns (uint) {
+        require(block.timestamp >= startTime && block.timestamp <= endTime, "Invalid deposit timing");
+        require(assets >= minDeposit, "Amount less than min deposit");
+        require(block.timestamp <= quoteExpiration, "Quote expired");
 
-        // Adjust amount to 18 decimals (shares have 18 decimals)
-        uint adjustedAmount = amount * (10 ** (DECIMALS - product.tokenDecimals));
+        uint maxAssets = maxDeposit(receiver);
+        if (assets > maxAssets) {
+            revert ERC4626ExceededMaxDeposit(receiver, assets, maxAssets);
+        }
 
-        // Now calculate the shares to mint based on the adjusted amount
-        uint quantity = (adjustedAmount * product.currentQuote) / (10 ** DECIMALS);
+        uint shares = previewDeposit(assets);
+        _deposit(_msgSender(), receiver, assets, shares);
 
-        // Transfer tokens from sender to treasury
-        IERC20(product.token).transferFrom(msg.sender, product.treasury, amount);
+        return shares;
+    }
 
-        // Mint share tokens to sender
-        ShareToken(product.tokenShare).mint(msg.sender, quantity);
-        product.totalShares += quantity;
-        product.totalDeposits += amount;
+     /**
+     * @dev Enhanced deposit function with quote validation.
+     * 
+     * This function allows users to specify the expected quote to ensure it matches the current quote before proceeding with the deposit.
+     * 
+     * @param assets Amount of tokens to deposit.
+     * @param expectedQuote The expected current quote, used for validation.
+     * @param receiver The address to receive the minted shares.
+     * @return The amount of shares minted.
+     */
+    function deposit(uint assets, uint expectedQuote, address receiver) public virtual nonReentrant whenNotStopped returns (uint) {
+        // Validate deposit timing and amount
+        require(block.timestamp >= startTime, "Not open yet");
+        require(block.timestamp <= endTime, "Maturity reached");
+        require(assets >= minDeposit, "Amount less than min deposit");
+        // Validate quote
+        require(_currentQuote == expectedQuote, "Quote changed");
+        require(block.timestamp <= quoteExpiration, "Quote expired");
 
-        emit Deposit(productId, msg.sender, amount, quantity);
-        emit SharesMinted(productId, msg.sender, quantity);
+        // Check max deposit limit
+        uint maxAssets = maxDeposit(receiver);
+        if (assets > maxAssets) {
+            revert ERC4626ExceededMaxDeposit(receiver, assets, maxAssets);
+        }
 
-        return quantity;
+        // Calculate and mint shares
+        uint shares = previewDeposit(assets);
+        _deposit(_msgSender(), receiver, assets, shares);
+
+        return shares;
+    }
+
+    ////////// MINT FUNCTIONS ////////
+
+    /**
+     * @dev Mint function with basic validation.
+     * 
+     * This function allows users to mint shares with basic validation of timing and amount.
+     * 
+     * @param shares The amount of shares to mint.
+     * @param receiver The address to receive the minted shares.
+     * @return The amount of assets minted.
+     */
+    function mint(uint256 shares, address receiver) public virtual nonReentrant whenNotStopped override returns (uint) {
+        require(block.timestamp >= startTime, "Not open yet");
+        require(block.timestamp <= endTime, "Maturity reached");
+        require(block.timestamp <= quoteExpiration, "Quote expired");
+
+        uint256 maxShares = maxMint(receiver);
+        if (shares > maxShares) {
+            revert ERC4626ExceededMaxMint(receiver, shares, maxShares);
+        }
+
+        uint256 assets = previewMint(shares);
+        require(assets >= minDeposit, "Amount less than min deposit");
+        _deposit(_msgSender(), receiver, assets, shares);
+
+        return assets;
     }
 
     /**
-     * @dev Withdraw tokens from the vault for a product by burning shares.
-     * @param productId Unique ID for the product.
-     * @param amount Amount of shares to burn.
-     * @return The amount of tokens withdrawn.
+     * @dev Mint function with quote validation.
+     * 
+     * This function allows users to specify the expected quote to ensure it matches the current quote before proceeding with the mint.
+     * 
+     * @param shares The amount of shares to mint.
+     * @param expectedQuote The expected current quote, used for validation.
+     * @param receiver The address to receive the minted shares.
+     * @return The amount of assets minted.
      */
-    function withdraw(uint productId, uint amount) external nonReentrant checkProductExistence(productId) returns (uint) {
-        Product storage product = products[productId];
-        require(block.timestamp >= product.endTime, "Maturity not reached");
-        require(product.availableRedemption > 0, "Redemption not set");
-        require(product.totalShares > 0, "No shares available");
+    function mint(uint256 shares, uint expectedQuote, address receiver) public virtual nonReentrant whenNotStopped returns (uint) {
+        require(block.timestamp >= startTime, "Not open yet");
+        require(block.timestamp <= endTime, "Maturity reached");
+        require(_currentQuote == expectedQuote, "Quote changed");
+        require(block.timestamp <= quoteExpiration, "Quote expired");
 
-        // Transfer share tokens from sender to contract
-        ShareToken shareToken = ShareToken(product.tokenShare);
-        shareToken.transferFrom(msg.sender, address(this), amount);
+        uint256 maxShares = maxMint(receiver);
+        if (shares > maxShares) {
+            revert ERC4626ExceededMaxMint(receiver, shares, maxShares);
+        }
 
-        // Calculate the amount to withdraw
-        uint assetAmount = (product.availableRedemption * amount) / product.totalShares;
+        uint256 assets = previewMint(shares);
+        require(assets >= minDeposit, "Amount less than min deposit");
+        _deposit(_msgSender(), receiver, assets, shares);
 
-        // Burn the shares
-        shareToken.burn(address(this), amount);
-        product.totalShares -= amount;
+        return assets;
+    }
 
-        // Update availableRedemption
-        product.availableRedemption -= assetAmount;
+    ////////// WITHDRAW FUNCTIONS ////////
 
-        // Transfer tokens to sender
-        IERC20(product.token).transfer(msg.sender, assetAmount);
+    /**
+     * @dev Withdraws assets from the vault by burning shares.
+     * 
+     * This function allows users to withdraw assets from the vault by burning their shares. It checks for maturity, available redemption, and total supply before proceeding.
+     * 
+     * @param assets The amount of assets to withdraw.
+     * @param receiver The address to receive the withdrawn assets.
+     * @param owner The address of the owner of the shares to be burned.
+     * @return The amount of shares burned.
+     */
+    function withdraw(uint256 assets, address receiver, address owner) public virtual nonReentrant override returns (uint) {
+        require(block.timestamp >= endTime, "Maturity not reached");
+        require(_availableRedemption > 0, "Redemption not set");
+        require(totalSupply() > 0, "No shares available");
 
-        emit Withdraw(productId, msg.sender, amount, assetAmount);
-        emit SharesBurned(productId, amount);
+        uint256 maxAssets = maxWithdraw(owner);
+        if (assets > maxAssets) {
+            revert ERC4626ExceededMaxWithdraw(owner, assets, maxAssets);
+        }
 
-        return assetAmount;
+        uint256 shares = previewWithdraw(assets);
+        _withdraw(_msgSender(), receiver, owner, assets, shares);
+
+        return shares;
     }
 
     /**
-     * @dev Set the total amount available for redemption for a product.
-     * @param productId Unique ID for the product.
-     * @param amount Total amount available for redemption.
+     * @dev Redeems shares for assets.
+     * 
+     * This function allows users to redeem their shares for assets. It checks for maturity, available redemption, and total supply before proceeding.
+     * 
+     * @param shares The amount of shares to redeem.
+     * @param receiver The address to receive the redeemed assets.
+     * @param owner The address of the owner of the shares to be redeemed.
+     * @return The amount of assets redeemed.
      */
-    function setTotalRedemption(uint productId, uint amount) external onlyProductAdmin(productId) checkProductExistence(productId) {
-        Product storage product = products[productId];
-        require(block.timestamp >= product.endTime, "Maturity not reached");
-        require(product.availableRedemption == 0, "Already set");
+    function redeem(uint256 shares, address receiver, address owner) public virtual nonReentrant override returns (uint256) {
+        require(block.timestamp >= endTime, "Maturity not reached");
+        require(_availableRedemption > 0, "Redemption not set");
+        require(totalSupply() > 0, "No shares available");
+
+        uint256 maxShares = maxRedeem(owner);
+        if (shares > maxShares) {
+            revert ERC4626ExceededMaxRedeem(owner, shares, maxShares);
+        }
+
+        uint256 assets = previewRedeem(shares);
+        _withdraw(_msgSender(), receiver, owner, assets, shares);
+
+        return assets;
+    }
+
+    ////////// ADMIN FUNCTIONS ////////
+
+    /**
+     * @dev This function sets the stopped state of the contract. It can only be called by the owner of the contract.
+     * 
+     * @param _stopped A boolean value indicating the new stopped state of the contract. If true, the contract is stopped; otherwise, it is not stopped.
+     */
+    function setContractStopped(bool _stopped) external onlyOwner {
+        stopped = _stopped;
+        emit ContractStopped(_stopped);
+    }
+
+    /**
+     * @dev Sets the total amount of assets available for redemption by users. This function can only be called by the owner of the contract.
+     * 
+     * This function updates the total amount of assets available for redemption by users. It first checks if the maturity time has been reached and if the available redemption amount has not been set before. 
+     * Then, it transfers the specified amount of assets from the owner's address to the contract's address, effectively setting the available redemption amount. 
+     * Finally, it emits an event to notify of the change.
+     * 
+     * @param amount The total amount of assets to be made available for redemption.
+     */
+    function setTotalRedemption(uint amount) external onlyOwner {
+        require(block.timestamp >= endTime, "Maturity not reached");
+        require(_availableRedemption == 0, "Already set");
 
         // Transfer tokens from admin to contract
-        IERC20(product.token).transferFrom(msg.sender, address(this), amount);
+        IERC20(asset()).transferFrom(msg.sender, address(this), amount);
 
-        product.availableRedemption = amount;
-        emit AvailableRedemptionSet(productId, amount);
+        _availableRedemption = amount;
+        availableRedemptionSet = true;
+        emit AvailableRedemptionSet(amount);
     }
 
     /**
-     * @dev Change the treasury address for a product.
-     * @param productId Unique ID for the product.
-     * @param newTreasury The new treasury address.
+     * @dev Updates the address of the custodian responsible for managing the vault's assets. This function can only be called by the owner of the contract.
+     * 
+     * @param newCustodian The address of the new custodian.
      */
-    function setTreasury(uint productId, address newTreasury) external onlyProductAdmin(productId) checkProductExistence(productId) {
-        products[productId].treasury = newTreasury;
-        emit TreasurySet(productId, newTreasury);
+    function setCustodian(address newCustodian) external onlyOwner {
+        _custodian = newCustodian;
+        emit CustodianSet(newCustodian);
     }
 
     /**
-     * @dev Change the admin address for a product.
-     * @param productId Unique ID for the product.
-     * @param newAdmin The new admin address.
+     * @dev Updates the address of the oracle responsible for setting the quote. This function can only be called by the owner of the contract.
+     * 
+     * @param newOracle The address of the new oracle.
      */
-    function setAdmin(uint productId, address newAdmin) external onlyProductAdmin(productId) checkProductExistence(productId) {
-        products[productId].admin = newAdmin;
-        emit AdminChanged(productId, newAdmin);
+    function setOracle(address newOracle) external onlyOwner {
+        oracle = newOracle;
     }
 
-    // External read functions
+    ////////// INTERNAL FUNCTIONS ////////
 
     /**
-     * @dev Get the total deposits for a product.
-     * @param productId Unique ID for the product.
-     * @return Total deposits.
+     * @dev Executes the common deposit/mint workflow.
+     * 
+     * This function verifies the allowance, transfers assets to the custodian, mints shares, updates total deposits, and emits a Deposit event.
+     * 
+     * @param caller The address initiating the deposit.
+     * @param receiver The address to receive the minted shares.
+     * @param assets The amount of assets to deposit.
+     * @param shares The amount of shares to mint.
      */
-    function totalDeposit(uint productId) external view checkProductExistence(productId) returns (uint) {
-        return products[productId].totalDeposits;
-    }
+    function _deposit(address caller, address receiver, uint assets, uint shares) internal virtual override {
+        uint allowance = IERC20(asset()).allowance(caller, address(this));
+        require(allowance >= assets, "Insufficient allowance");
+        // Transfer tokens from sender to custodian
+        SafeERC20.safeTransferFrom(IERC20(asset()), caller, _custodian, assets);
 
-    /**
-     * @dev Get the available redemption amount for a product.
-     * @param productId Unique ID for the product.
-     * @return Available redemption amount.
-     */
-    function availableRedemption(uint productId) external view checkProductExistence(productId) returns (uint) {
-        return products[productId].availableRedemption;
-    }
+        // Mint share tokens to sender
+        _mint(receiver, shares);
 
-    /**
-     * @dev Get the total bonds (shares) for a product.
-     * @param productId Unique ID for the product.
-     * @return Total bonds.
-     */
-    function totalBonds(uint productId) external view checkProductExistence(productId) returns (uint) {
-        return products[productId].totalShares;
+        _totalDeposits += assets;
+        emit Deposit(caller, receiver, assets, shares);
     }
 
     /**
-     * @dev Get the maturity time for a product.
-     * @param productId Unique ID for the product.
-     * @return Maturity timestamp.
+     * @dev Executes the common workflow for withdrawing/redeeming shares.
+     * 
+     * This function handles the logic for withdrawing assets from the vault by burning shares. It checks for allowance, burns shares, updates available redemption, transfers assets, and emits a Withdraw event.
+     * 
+     * @param caller The address initiating the withdrawal.
+     * @param receiver The address to receive the withdrawn assets.
+     * @param owner The address of the owner of the shares to be burned.
+     * @param assets The amount of assets to be withdrawn.
+     * @param shares The amount of shares to be burned.
      */
-    function maturity(uint productId) external view checkProductExistence(productId) returns (uint) {
-        return products[productId].endTime;
+    function _withdraw(
+        address caller,
+        address receiver,
+        address owner,
+        uint256 assets,
+        uint256 shares
+    ) internal virtual override {
+        if (caller != owner) {
+            _spendAllowance(owner, caller, shares);
+        }
+
+        _burn(owner, shares);
+        _availableRedemption -= assets;
+        
+        SafeERC20.safeTransfer(IERC20(asset()), receiver, assets);
+
+        emit Withdraw(caller, receiver, owner, assets, shares);
     }
 
     /**
-     * @dev Get the admin address for a product.
-     * @param productId Unique ID for the product.
-     * @return Admin address.
+     * @dev Override the _decimalsOffset function to return the correct offset.
+     * 
+     * This function calculates the offset in the decimal representation between the underlying asset's decimals
+     * and the vault decimals.
+     * 
+     * @return The calculated offset.
      */
-    function admin(uint productId) external view checkProductExistence(productId) returns (address) {
-        return products[productId].admin;
+    function _decimalsOffset() internal view virtual override returns (uint8) {
+        return DECIMALS - tokenDecimals;
     }
 
     /**
-     * @dev Get the treasury address for a product.
-     * @param productId Unique ID for the product.
-     * @return Treasury address.
+     * @dev Internal conversion function (from assets to shares) with support for rounding direction.
+     * @param assets The amount of assets to convert.
+     * @param rounding The rounding direction to use.
+     * @return The calculated amount of shares.
      */
-    function treasuryAccount(uint productId) external view checkProductExistence(productId) returns (address) {
-        return products[productId].treasury;
+    function _convertToShares(uint assets, Math.Rounding rounding) internal view virtual override returns (uint) {
+        // Adjust amount to 18 decimals (shares have 18 decimals)
+        uint adjustedAmount = assets * (10 ** (_decimalsOffset()));
+
+        // Now calculate the shares to mint based on the adjusted amount
+        return adjustedAmount.mulDiv(quote(), 10 ** DECIMALS, rounding);
     }
 
     /**
-     * @dev Get the bond token address for a product.
-     * @param productId Unique ID for the product.
-     * @return Bond token address.
+     * @dev This function converts a given amount of shares to assets, taking into account the rounding direction specified.
+     * 
+     * It first checks if the available redemption amount is greater than zero, ensuring that there are assets available for redemption.
+     * Then, it calculates the equivalent asset amount for the given shares by dividing the available redemption amount by the total supply of shares,
+     * applying the specified rounding direction to the result.
+     * 
+     * @param shares The amount of shares to convert to assets.
+     * @param rounding The rounding direction to use for the conversion.
+     * @return The calculated amount of assets equivalent to the given shares.
      */
-    function bondId(uint productId) external view checkProductExistence(productId) returns (address) {
-        return products[productId].tokenShare;
+    function _convertToAssets(uint shares, Math.Rounding rounding) internal view virtual override returns (uint) {
+        require(_availableRedemption > 0, "AvailableRedemption must be greater than 0");
+        return shares.mulDiv(_availableRedemption, totalSupply(), rounding);
+    }
+
+    ////////// HELPER FUNCTIONS ////////
+
+    /**
+     * @dev Preview mint amount based on shares.
+     * @param shares Shares to mint.
+     * @return Assets required for minting.
+     */
+    function previewMint(uint256 shares) public view virtual override returns (uint) {
+        return shares.mulDiv(10 ** DECIMALS, quote(), Math.Rounding.Ceil) / 10 ** (_decimalsOffset());
+    }
+
+    /**
+     * @dev Preview withdraw amount based on assets.
+     * @param assets Assets to withdraw.
+     * @return Shares to be withdrawn.
+     */
+    function previewWithdraw(uint256 assets) public view virtual override returns (uint) {
+        require(_availableRedemption > 0, "AvailableRedemption must be greater than 0");
+        return assets.mulDiv(totalSupply(), _availableRedemption, Math.Rounding.Ceil);
     }
 }
