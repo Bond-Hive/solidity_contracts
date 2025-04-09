@@ -1,76 +1,143 @@
+# MaxBTC
 
-# BondHive Smart Contract
-
-Welcome to the official Solidity smart contract repository for **BondHive**, a decentralized platform offering on-chain bonds built on Ethereum. This repository contains the core smart contracts that manage the bond issuance, purchasing, and redemption processes in a trustless and transparent manner.
-
-BondHive enables users to issue, purchase, and claim fixed yield bonds on the Ethereum blockchain, ensuring security and decentralization.
-
-This contract adheres to the ERC4626 standard to provide a smooth user experience and compatibility within the EVM ecosystem, ensuring compliance with established standards. The exchange rate in this contract is fixed and cannot be manipulated, as it is determined by an external quote provided by an oracle. The goal is to have a fully decentralized oracle to minimize trust issues; however, if that is not achieved, a trust assumption must be made.
+A perpetual yield-bearing vault for Bitcoin exposure on Ethereum.
 
 ## Overview
 
-BondHive empowers users to:
-
-- **Issue bonds**: Create bonds with predefined terms such as fixed interest rates and maturity dates.
-- **Purchase bonds**: Allow investors to buy bonds and receive fixed returns at the end of the bond term.
-- **Claim yields**: Bondholders can redeem their principal and accumulated interest upon bond maturity.
+MaxBTC is a smart contract that functions as a yield-bearing vault, allowing users to deposit BTC supported assets and receive MaxBTC tokens in return. These tokens represent a claim on the underlying assets plus any yield generated through the custodial management of the deposited funds.
 
 ## Key Features
 
-- **Fixed Yield Bonds**: Each bond guarantees a fixed interest rate, offering predictable and secure returns.
-- **Quote Management**: The quote must be available in the smart contract before a user can deposit. It has a limited validity period, meaning it must be updated once expired before allowing further deposits. Users can utilize the `previewDeposit` function at any time to assess how many bonds they will receive based on a specific USDC amount deposited. The quote can be verified by users as it fetches Binance Spot and delivery futures prices for the underlying bond pair.
-- **Asset Management**: Since assets are held in a custodian wallet and some are invested, the actual amount of deposited assets is used instead of the current balance to measure the total assets amount.
-- **Decentralized and Trustless**: Bond issuance and redemption are fully handled by smart contracts, eliminating intermediaries and enhancing security.
-- **On-Chain Transactions**: All bond data and transactions are stored on the Ethereum blockchain, ensuring transparency and immutability.
-- **Open-Source Codebase**: Our contracts are open for public review and contribution.
+- **Multi-Asset Support**: Deposit WBTC (WBTC, cbBTC, etc.)
+- **Yield Generation**: Exposure to Bitcoin with additional yield potential
+- **Time-Based Maturity**: Defined deposit period and maturity for redemptions
+- **Oracle Price Feeds**: Fair conversion rates through trusted oracle data
+- **Flexible Redemption**: Redeem MaxBTC tokens for underlying assets after maturity
 
-## Getting Started
+## Contract Architecture
 
-### Prerequisites
-- Solidity ^0.8.x
-- Node.js and npm
-- Hardhat or Truffle for contract deployment and testing
+The MaxBTC contract is built on Ethereum using Solidity 0.8.28 and implements several OpenZeppelin contracts:
 
-### Installation
+- **ERC20**: For the MaxBTC token functionality
+- **ReentrancyGuard**: To prevent reentrancy attacks
+- **Ownable**: For administrative control
+- **Math**: For safe mathematical operations
+- **SafeERC20**: For safe token transfers
 
-Clone the repo and install dependencies:
+## Usage
 
-\`\`\`bash
-git clone https://github.com/BondHive/bondhive-solidity.git
-cd bondhive-solidity
-npm install
-\`\`\`
+### For Users
 
-### Compilation & Deployment
+#### Depositing Assets
 
-Compile the smart contracts:
+Users can deposit supported assets to receive MaxBTC tokens:
 
-\`\`\`bash
-npx hardhat compile
-\`\`\`
+```solidity
+// Standard deposit
+function deposit(uint assets, address receiver) public returns (uint)
 
-Deploy to your preferred network (make sure you configure the networks in \`hardhat.config.js\`):
+// Deposit with quote validation
+function deposit(uint assets, uint expectedQuote, address receiver) public returns (uint)
+```
 
-\`\`\`bash
-npx hardhat run scripts/deploy.js --network <network_name>
-\`\`\`
+#### Minting MaxBTC Tokens
 
-### Testing
+Users can mint a specific amount of MaxBTC tokens:
 
-Run the tests to ensure everything is working correctly:
+```solidity
+// Standard mint
+function mint(uint256 amount, address receiver) public returns (uint)
 
-\`\`\`bash
-npx hardhat test
-\`\`\`
+// Mint with quote validation
+function mint(uint256 amount, uint expectedQuote, address receiver) public returns (uint)
+```
 
----
+#### Redeeming After Maturity
 
-## Contributing
+After the maturity date, users can redeem their MaxBTC tokens:
 
-We welcome contributions from the community. Please feel free to open issues or submit pull requests.
+```solidity
+// Withdraw a specific amount of assets
+function withdraw(uint256 assets, address receiver, address owner) public returns (uint)
 
----
+// Redeem a specific amount of MaxBTC tokens
+function redeem(uint256 amount, address receiver, address owner) public returns (uint256)
+```
+
+### For Administrators
+
+```solidity
+// Initialize the product
+function initializeProduct(ProductParams memory params) external onlyOwner
+
+// Add a supported asset
+function addAsset(address asset, uint256 minDepositAmount) external onlyOwner
+
+// Set the custodian address
+function setCustodian(address newCustodian) external onlyOwner
+
+// Set the oracle address
+function setOracle(address newOracle) external onlyOwner
+
+// Emergency stop functionality
+function setContractStopped(bool _stopped) external onlyOwner
+```
+
+### For Oracle
+
+```solidity
+// Set the quote for an asset
+function setQuote(address asset, uint amount) external onlyOracle
+```
+
+## Product Flow
+
+1. **Initialization**:
+   - Contract owner initializes the product with parameters (start time, end time, etc.)
+   - Owner adds supported assets with minimum deposit amounts
+
+2. **Deposit Phase** (before maturity):
+   - Oracle sets quotes for supported assets
+   - Users deposit assets and receive MaxBTC tokens
+   - Assets are transferred to the custodian for management
+
+3. **Maturity Phase** (after end time):
+   - Available redemption amount is set
+   - Users can redeem their MaxBTC tokens for assets
+   - Redemption is proportional to user's share of total supply
+
+## Events
+
+- `ProductInitialized`: When the product is initialized
+- `AssetAdded`: When a new asset is added
+- `QuoteSet`: When a new quote is set for an asset
+- `Deposit`: When a user deposits assets
+- `Withdraw`: When a user withdraws assets
+- `AvailableRedemptionSet`: When the redemption amount is updated
+- `CustodianSet`: When the custodian address is changed
+- `ContractStopped`: When the contract's stopped state changes
+
+## Security Features
+
+- **Reentrancy Protection**: Guards against reentrancy attacks
+- **Access Control**: Owner and oracle-restricted functions
+- **Quote Validation**: Users can validate quotes before transacting
+- **Minimum Deposit**: Prevents dust attacks
+- **Emergency Stop**: Contract can be paused in emergency situations
+
+## Contract Interface
+
+```solidity
+struct ProductParams {
+    uint startTime;      // Start time for deposits
+    uint endTime;        // End time (maturity)
+    uint minDeposit;     // Minimum deposit amount
+    uint quotePeriod;    // Duration for which the quote is valid
+    address custodian;   // Custodian address
+    address oracle;      // Oracle address
+}
+```
 
 ## License
 
-This project is licensed under the MIT License.
+This project is licensed under the MIT License - see the LICENSE file for details.
